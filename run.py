@@ -16,6 +16,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
+
 from coconut import Coconut
 from dataset import (
     get_dataset,
@@ -34,6 +35,8 @@ import gc
 import argparse
 import functools
 from utils import Config, set_seed
+
+
 
 
 def main():
@@ -172,8 +175,8 @@ def main():
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
+            GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
+            #LlamaDecoderLayer  # only shard llama's layers.
         },
     )
 
@@ -243,6 +246,96 @@ def main():
     best_acc = 0
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+
+    theta0 = None
+    # 用于存储最近 T0 步的梯度
+    recent_gradients = []
+
+    def estimate_iiw(parallel_model, current_gradients, theta0, theta_bar, n_samples, T0, rank, world_size):
+        """
+        估计 Information in Weights (IIW) 的近似值。
+        
+        Args:
+            parallel_model: FSDP封装的模型
+            current_gradients: 当前步骤的梯度列表 (来自backward后的grad)
+            theta0: 初始模型权重 (先验均值)
+            theta_bar: 移动平均后的模型权重 (论文中的 θ̄_S)
+            n_samples: 训练集总样本数
+            T0: 信息估计迭代次数 (这里指梯度累积步数)
+            rank: 当前进程的rank
+            world_size: 总进程数
+
+        Returns:
+            I_tilde (float): 估计的IIW值 (在rank0上)
+        """
+        # 只在rank 0上进行计算和聚合
+        if rank != 0:
+            # 非0号rank只需要将梯度发送给0号rank
+            if current_gradients:
+                for grad in current_gradients:
+                    dist.send(grad, dst=0)
+            return None
+
+        # 1. 收集所有GPU上的梯度并求平均
+        # 假设 current_gradients 是一个包含所有参数梯度的列表
+        # 我们需要从所有world_size个进程中收集
+        all_gradients = [current_gradients]  # 0号rank自己的梯度
+        for src_rank in range(1, world_size):
+            # 为每个其他rank创建一个梯度列表的占位符
+            src_grads = []
+            for param in parallel_model.parameters():
+                if param.requires_grad:
+                    # 创建一个与param.grad形状相同的张量来接收
+                    recv_grad = torch.zeros_like(param.grad)
+                    dist.recv(recv_grad, src=src_rank)
+                    src_grads.append(recv_grad)
+            all_gradients.append(src_grads)
+        
+        # 将所有梯度在 batch 维度上平均 (模拟数据并行的平均效果)
+        averaged_gradients = []
+        for i in range(len(current_gradients)):
+            stacked_grads = torch.stack([grads[i] for grads in all_gradients], dim=0) # [world_size, ...]
+            mean_grad = stacked_grads.mean(dim=0) # 在world_size维度上平均
+            averaged_gradients.append(mean_grad)
+
+        # 2. 将当前平均梯度添加到 recent_gradients 队列
+        recent_gradients.append(averaged_gradients)
+        # 保持队列长度为 T0
+        if len(recent_gradients) > T0:
+            recent_gradients.pop(0)
+
+        # 3. 计算 Δθ = θ_bar - θ0
+        # 注意: theta_bar 和 theta0 应该是展平后的向量
+        # 这里需要您根据实际情况实现展平和恢复
+        # 为了简化，我们假设有一个函数来处理
+        def flatten_params(params):
+            return torch.cat([param.view(-1) for param in params])
+
+        # 获取当前模型权重 (θ_bar)
+        with torch.no_grad():
+            current_params = [param.data.clone() for param in parallel_model.parameters() if param.requires_grad]
+        flat_theta_bar = flatten_params(current_params)
+        flat_theta0 = flatten_params(theta0)
+
+        delta_theta = flat_theta_bar - flat_theta0 # [D,]
+
+        # 4. 计算 I_tilde = n * sum_{t=1}^{T1} (Δθ^T * ∇L_t)^2 / T1
+        # 公式 (15): I˜(w; S)= n / T1 * sum_{t=1}^{T1} [Δθ>∇θ`_t(θˆ)]^2
+        T1 = len(recent_gradients) # 实际累积的步数
+        if T1 == 0:
+            return 0.0
+
+        sum_sq_term = 0.0
+        for grad_list in recent_gradients:
+            # 将梯度展平
+            flat_grad = flatten_params(grad_list) # [D,]
+            # 计算 Δθ^T * ∇L_t
+            inner_product = torch.dot(delta_theta, flat_grad)
+            sum_sq_term += inner_product.item() ** 2
+
+        I_tilde = (n_samples / T1) * sum_sq_term
+        return I_tilde
+
 
     for epoch in range(configs.resume, configs.num_epochs):
 
@@ -332,31 +425,17 @@ def main():
                 dynamic_ncols=True,
             )
 
-            for step, batch in enumerate(train_dataloader):
-                '''
-                if step == 0 and swanlab_run and rank == 0:
-                    print("logging training data")
-                    cur_bs = len(batch["input_ids"])
-                    text_str = ""
-                    for data_idx in range(cur_bs):
-                        for token_idx in range(len(batch["input_ids"][data_idx])):
-                            text_str += (
-                                str(batch["input_ids"][data_idx][token_idx].item())
-                                + " "
-                                + str(batch["labels"][data_idx][token_idx].item())
-                                + " "
-                                + tokenizer.decode(
-                                    batch["input_ids"][data_idx][token_idx]
-                                )
-                                + "\n"
-                            )
-                        text_str += "====" * 10 + "\n"
-                    text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
+            # 关键: 在第一次迭代时获取 theta0
+            if theta0 is None and epoch == configs.resume:
+                # 获取当前模型的所有参数作为 theta0
+                theta0 = [param.data.clone().detach() for param in parallel_model.parameters() if param.requires_grad]
+                print(f"Rank {rank}: Captured initial model weights (theta0) at start of epoch {epoch}.")
+                # 广播给所有进程，确保一致性
+                for param in theta0:
+                    dist.broadcast(param, src=0)
 
-                    swanlab_run.log({"data_table": copy(text_table)})
-                '''
+            for step, batch in enumerate(train_dataloader):
+
                 total_train_steps += 1
                 batch = {
                     key: batch[key].to(rank) for key in batch.keys() if key != "idx"
@@ -367,9 +446,28 @@ def main():
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
 
-                if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
-                    train_dataloader
-                ) - 1:
+
+
+                if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    # 获取当前所有参数的梯度
+                    current_gradients = []
+                    for param in parallel_model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            current_gradients.append(param.grad.clone()) # 克隆以避免被清零影响
+
+                    # 调用估计函数
+                    # T0 被设为梯度累积步数，n_samples 需要您提供（例如，训练集大小）
+                    n_samples = 32  # <-- 请替换为您的实际训练集样本总数
+                    T0 = configs.gradient_accumulation_steps
+                    I_tilde = estimate_iiw(parallel_model, current_gradients, theta0, None, n_samples, T0, rank, world_size)
+
+                    # 只有 rank 0 会返回值
+                    if rank == 0 and I_tilde is not None:
+                        print(f"Estimated IIW (I_tilde): {I_tilde}")
+                        if swanlab_run:
+                            swanlab_run.log({"train/IIW": I_tilde})
+                    # ====================================================
+
                     optimizer.step()
                     optimizer.zero_grad()
                     pbar.update(1)
@@ -407,130 +505,6 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # val loss
-            total_loss = 0
-
-            with torch.no_grad():
-                parallel_model.module.eval()
-                for step, batch in enumerate(valid_loss_dataloader):
-
-                    batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key != "idx"
-                    }
-
-                    outputs = parallel_model(**batch)
-                    loss = outputs.loss
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    total_loss += loss.item() / world_size
-
-                if swanlab_run and rank == 0:
-
-                    log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
-                    }
-                    swanlab_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
-
-        # val generation accuracy
-        total_length = len(valid_gen_dataloader)
-
-        pbar = tqdm(
-            colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
-        )
-        cor, cor_cot, total = (
-            torch.tensor(0, device=rank),
-            torch.tensor(0, device=rank),
-            torch.tensor(0, device=rank),
-        )
-
-        with torch.no_grad():
-            parallel_model.module.eval()
-            for idx, batch in enumerate(valid_gen_dataloader):
-                test_idx = batch["idx"][0]
-
-                batch = {
-                    k: v.to(rank)
-                    for k, v in batch.items()
-                    if v != None and k not in ["idx", "position_ids"]
-                }
-                # https://github.com/huggingface/transformers/issues/32492
-
-                assert len(batch["input_ids"]) == 1
-                answer = answers_val[test_idx.cpu().item()]
-                answer_cot = cot_val[test_idx.cpu().item()]
-                question = question_val[test_idx.cpu().item()]
-
-                total += 1
-
-                # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
-                outputs = parallel_model.module.generate(
-                    **batch,
-                    max_new_tokens=max_new_tokens,
-                    synced_gpus=not configs.only_eval,
-                )
-
-                text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                answer_output = text_output.split("#")[-1].replace(",", "").strip()
-                cot_output = (
-                    ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
-                )
-
-                if idx < 5 and rank == 0:
-                    # print some examples
-                    print(
-                        f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'"
-                    )
-                    print(f"Full output: '{tokenizer.decode(outputs[0])}'")
-                    print(f"Extracted Output: '{answer_output}'")
-
-                cor += answer_output == answer
-                cor_cot += cot_output == answer_cot
-
-                pbar.update(1)
-                pbar.set_description(
-                    f"Test accuracy: {round(float(cor.detach().float() / total.detach().float()), 2)}"
-                )
-
-            pbar.close()
-            print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
-
-        dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
-        dist.all_reduce(cor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total, op=dist.ReduceOp.SUM)
-
-        cor_cot = cor_cot.item()
-        cor = cor.item()
-        total = total.item()
-        if rank == 0:
-            print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
-            print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
-        sys.stdout.flush()
-
-        if swanlab_run:
-            swanlab_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
-
-        if configs.only_eval:
-            break
-
-        dist.barrier()
-        if (
-            cor / total > best_acc
-            and configs.save_only_improve
-            and not configs.debug
-            and not configs.only_eval
-        ):
-            states = parallel_model.state_dict()
-
-            if rank == 0:
-                torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
-                print("saving model.")
-
-            best_acc = cor / total
-
-            dist.barrier()
-            del states
-            gc.collect()
-            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

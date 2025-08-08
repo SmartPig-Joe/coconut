@@ -22,7 +22,7 @@ model_id: /home/coconut/gpt2
 load_model_path: None
 seed: 0
 resume: 0
-bf16: False
+bf16: True
 train_path: data/prosqa_train.json
 val_path: data/prosqa_valid.json
 reset_optimizer: True
