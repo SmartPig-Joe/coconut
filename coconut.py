@@ -54,6 +54,8 @@ class Coconut(nn.Module):
         embedding_dim = self.embedding.weight.shape[1] 
         # 定义一个LayerNorm层，用于归一化隐藏状态
         self.latent_norm = nn.LayerNorm(embedding_dim)
+        # 用于跨测试集收集 IS（最大核采样概率）值
+        self.all_is_values = []
 
 
     def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
@@ -241,6 +243,80 @@ class Coconut(nn.Module):
         """设置模型为评估模式"""
         self.base_causallm.eval()
 
+    @staticmethod
+    def _compute_IS_values(reasoning_logits, top_p=0.95):
+        """计算每个推理步骤的 IS 值（top-p 核采样集合中的最大概率）。
+
+        对于每个步骤，先对 logits 做 softmax，再按降序排序，累积概率超过 top_p
+        时截断，IS = 核集合中的最大概率（即排序后的第一个概率值）。
+
+        Args:
+            reasoning_logits: shape [num_steps, vocab_size] 的 logits 张量。
+            top_p: 核采样的概率阈值，默认 0.95。
+
+        Returns:
+            list[float]: 每个步骤对应的 IS 值。
+        """
+        probs = torch.softmax(reasoning_logits.detach().cpu().float(), dim=-1)
+        is_values = []
+        for i in range(probs.shape[0]):
+            p = probs[i]
+            sorted_probs, _ = torch.sort(p, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            # 找到核集合的截止位置（累积概率首次超过 top_p）
+            cutoff = (cumulative >= top_p).nonzero(as_tuple=True)[0]
+            if cutoff.numel() > 0:
+                nucleus_probs = sorted_probs[: cutoff[0].item() + 1]
+            else:
+                # 所有 token 的累积概率仍不足 top_p（数值精度问题），使用全部 token
+                nucleus_probs = sorted_probs
+            # IS = 核集合中的最大概率（即排序后的第一个）
+            is_values.append(nucleus_probs[0].item())
+        return is_values
+
+    def _plot_IS_histogram(self, save_path="is_histogram.pdf", title="IS Distribution Across Test Set", n_bins=20):
+        """将收集到的 IS 值绘制为直方图并保存。
+
+        横轴为 IS 值（0–1），纵轴为落在每个子区间的步骤频数。
+        绘图后会清空 all_is_values，以便下次重新收集。
+
+        Args:
+            save_path: 输出文件路径（支持 .pdf 或 .png）。
+            title: 图标题，为空则不显示。
+            n_bins: 横轴划分的子区间数量，默认 20。
+        """
+        if not self.all_is_values:
+            print("No IS values collected. Skipping histogram.")
+            return
+
+        values = np.array(self.all_is_values)
+        bins = np.linspace(0, 1, n_bins + 1)
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(values, bins=bins, color='steelblue', edgecolor='white', linewidth=0.5)
+
+        ax.set_xlabel("IS (Max Nucleus Probability)")
+        ax.set_ylabel("Frequency (Steps)")
+        if title:
+            ax.set_title(title)
+        ax.set_xlim(0, 1)
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_linewidth(0.5)
+        ax.spines['left'].set_linewidth(0.5)
+
+        plt.tight_layout()
+
+        if not save_path.endswith(('.pdf', '.png')):
+            save_path += '.pdf'
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"IS histogram saved to {save_path} (n={len(values)} steps total)")
+
+        # 清空，以便下次重新收集
+        self.all_is_values = []
+
     def _plot_logit_evolution(self, reasoning_logits, tokenizer, top_p=0.95, save_path="logit_evolution_renormalized.pdf"):
         # 1. Convert logits to probabilities on CPU
         probs_over_steps = torch.softmax(reasoning_logits.detach().cpu(), dim=-1)
@@ -397,6 +473,13 @@ class Coconut(nn.Module):
         )
         # 获取经过潜在推理后的最终输入嵌入
         inputs_embeds = outputs.inputs_embeds
+
+        # --- 收集潜在推理步骤的 IS 值（所有 rank 均执行）---
+        latent_positions = (input_ids[0] == self.latent_token_id).nonzero(as_tuple=True)[0]
+        if latent_positions.numel() > 0:
+            logit_indices_for_reasoning = latent_positions - 1
+            reasoning_logits_latent = outputs.logits[0, logit_indices_for_reasoning, :]
+            self.all_is_values.extend(self._compute_IS_values(reasoning_logits_latent))
 
         # --- 【修改点 1】: 移除原有的可视化代码块 ---
         # 原有的代码块在这里被删除了。

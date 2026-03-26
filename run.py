@@ -488,6 +488,32 @@ def main():
             print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
         sys.stdout.flush()
 
+        # --- 收集所有 rank 的 IS 值并在 rank 0 绘制直方图 ---
+        if configs.coconut:
+            local_is_values = parallel_model.module.all_is_values
+            gathered_is_values = [None] * world_size
+            dist.gather_object(local_is_values, gathered_is_values if rank == 0 else None, dst=0)
+            if rank == 0:
+                all_is = []
+                for vals in gathered_is_values:
+                    if vals:
+                        all_is.extend(vals)
+                parallel_model.module.all_is_values = all_is
+                val_path_lower = configs.val_path.lower()
+                if 'gsm' in val_path_lower:
+                    dataset_tag = 'gsm'
+                elif 'pros' in val_path_lower or 'prosqa' in val_path_lower:
+                    dataset_tag = 'prosqa'
+                else:
+                    dataset_tag = os.path.splitext(os.path.basename(configs.val_path))[0]
+                parallel_model.module._plot_IS_histogram(
+                    save_path=f"is_histogram_{dataset_tag}_epoch{epoch + 1}.pdf",
+                    title=f"IS Distribution ({dataset_tag.upper()}, Epoch {epoch + 1})",
+                )
+            else:
+                # 清空本 rank 收集的 IS 值，避免跨 epoch 累积
+                parallel_model.module.all_is_values = []
+
         if swanlab_run:
             swanlab_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
 
