@@ -532,6 +532,7 @@ class Coconut(nn.Module):
         print(f"[Rank {rank}] Loop finished. Collected {len(cot_logits_list)} sets of logits.", flush=True)
 
         # --- Plotting logic ---
+        '''
         is_main_process = (rank == 0 or rank == -1) # rank -1 for non-distributed case
         if is_main_process and tokenizer and cot_logits_list:
             print(f"[Rank {rank}] Conditions met for plotting. Stacking logits.", flush=True)
@@ -549,7 +550,7 @@ class Coconut(nn.Module):
             print(f"[Rank {rank}] On main process but skipping plot. "
                   f"Tokenizer exists: {tokenizer is not None}, "
                   f"Logits exist: {bool(cot_logits_list)}", flush=True)
-
+        '''
         if synced_gpus:
             # in FSDP, the number of forward pass need to be the same across devices
             while (
