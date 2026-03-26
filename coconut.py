@@ -244,15 +244,17 @@ class Coconut(nn.Module):
         self.base_causallm.eval()
 
     @staticmethod
-    def _compute_IS_values(reasoning_logits, top_p=0.95):
+    def _compute_IS_values(reasoning_logits, top_p=0.95, skip_top_k=0):
         """计算每个推理步骤的 IS 值（top-p 核采样集合中的最大概率）。
 
-        对于每个步骤，先对 logits 做 softmax，再按降序排序，累积概率超过 top_p
-        时截断，IS = 核集合中的最大概率（即排序后的第一个概率值）。
+        对于每个步骤，先对 logits 做 softmax，再按降序排序，跳过概率最高的
+        skip_top_k 个 token，对剩余分布重新归一化后做 top-p 核采样，
+        IS = 剩余核集合中的最大（归一化后）概率。
 
         Args:
             reasoning_logits: shape [num_steps, vocab_size] 的 logits 张量。
             top_p: 核采样的概率阈值，默认 0.95。
+            skip_top_k: 跳过概率最高的前 k 个 token，默认 0（不跳过）。
 
         Returns:
             list[float]: 每个步骤对应的 IS 值。
@@ -262,15 +264,24 @@ class Coconut(nn.Module):
         for i in range(probs.shape[0]):
             p = probs[i]
             sorted_probs, _ = torch.sort(p, descending=True)
-            cumulative = torch.cumsum(sorted_probs, dim=-1)
-            # 找到核集合的截止位置（累积概率首次超过 top_p）
+
+            # 跳过概率最高的 skip_top_k 个 token
+            remaining_probs = sorted_probs[skip_top_k:]
+            if remaining_probs.numel() == 0:
+                continue
+            sum_remaining = remaining_probs.sum()
+            if sum_remaining <= 1e-9:
+                continue
+
+            # 对剩余分布重新归一化后做 top-p 核采样
+            renorm_probs = remaining_probs / sum_remaining
+            cumulative = torch.cumsum(renorm_probs, dim=-1)
             cutoff = (cumulative >= top_p).nonzero(as_tuple=True)[0]
             if cutoff.numel() > 0:
-                nucleus_probs = sorted_probs[: cutoff[0].item() + 1]
+                nucleus_probs = renorm_probs[: cutoff[0].item() + 1]
             else:
-                # 所有 token 的累积概率仍不足 top_p（数值精度问题），使用全部 token
-                nucleus_probs = sorted_probs
-            # IS = 核集合中的最大概率（即排序后的第一个）
+                nucleus_probs = renorm_probs
+            # IS = 剩余核集合中的最大归一化概率（即第一个）
             is_values.append(nucleus_probs[0].item())
         return is_values
 
@@ -335,8 +346,8 @@ class Coconut(nn.Module):
                 continue
 
             # a. Remove top-1 token
-            sorted_probs_remaining = sorted_probs_full[0:]
-            sorted_indices_remaining = sorted_indices_full[0:]
+            sorted_probs_remaining = sorted_probs_full[1:]
+            sorted_indices_remaining = sorted_indices_full[1:]
             
             sum_of_remaining_probs = torch.sum(sorted_probs_remaining)
             if sum_of_remaining_probs <= 1e-9:
@@ -479,7 +490,7 @@ class Coconut(nn.Module):
         if latent_positions.numel() > 0:
             logit_indices_for_reasoning = latent_positions - 1
             reasoning_logits_latent = outputs.logits[0, logit_indices_for_reasoning, :]
-            self.all_is_values.extend(self._compute_IS_values(reasoning_logits_latent))
+            self.all_is_values.extend(self._compute_IS_values(reasoning_logits_latent, skip_top_k=1))
 
         # --- 【修改点 1】: 移除原有的可视化代码块 ---
         # 原有的代码块在这里被删除了。
