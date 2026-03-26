@@ -6,6 +6,23 @@ from transformers.models.gpt2 import GPT2LMHeadModel
 from sklearn.decomposition import PCA
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import numpy as np
+import matplotlib
+import torch.distributed as dist
+import sys
+
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+matplotlib.rcParams['font.family'] = 'serif'
+matplotlib.rcParams['font.serif'] = ['Times New Roman', 'Computer Modern', 'DejaVu Serif']
+matplotlib.rcParams['axes.labelsize'] = 14
+matplotlib.rcParams['axes.titlesize'] = 16
+matplotlib.rcParams['xtick.labelsize'] = 12
+matplotlib.rcParams['ytick.labelsize'] = 12
+matplotlib.rcParams['legend.fontsize'] = 11
+matplotlib.rcParams['figure.titlesize'] = 16
 
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
@@ -32,6 +49,12 @@ class Coconut(nn.Module):
         self.end_latent_id = end_latent_id
 
         self.embedding = self.base_causallm.transformer.get_input_embeddings()
+        # --- 新增代码 ---
+        # 获取嵌入向量的维度
+        embedding_dim = self.embedding.weight.shape[1] 
+        # 定义一个LayerNorm层，用于归一化隐藏状态
+        self.latent_norm = nn.LayerNorm(embedding_dim)
+
 
     def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
 
@@ -145,11 +168,19 @@ class Coconut(nn.Module):
             # 将指定位置的嵌入向量替换为上一轮前向传播得到的隐藏状态
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
-                # 将该位置的嵌入替换为前一个token（token_idx-1）的隐藏状态
-                # 需要减去hidden_states_offset来校正索引
-                tensor_list[batch_idx][token_idx] = hidden_states[
+
+                # 1. 提取出原始的“思考结果”（即前一个token的隐藏状态）
+                thought_vector = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
+
+                # 2. 【新增步骤】对这个向量进行归一化
+                normalized_thought_vector = self.latent_norm(thought_vector)
+                #normalized_thought_vector = thought_vector
+
+
+                # 3. 将归一化后的向量赋值给潜在标记的位置
+                tensor_list[batch_idx][token_idx] = normalized_thought_vector # <-- 使用归一化后的向量
 
             # 将修改后的列表重新组装成张量
             inputs_embeds = torch.stack(
@@ -210,15 +241,139 @@ class Coconut(nn.Module):
         """设置模型为评估模式"""
         self.base_causallm.eval()
 
+    def _plot_logit_evolution(self, reasoning_logits, tokenizer, top_p=0.95, save_path="logit_evolution_renormalized.pdf"):
+        # 1. Convert logits to probabilities on CPU
+        probs_over_steps = torch.softmax(reasoning_logits.detach().cpu(), dim=-1)
+        num_steps = probs_over_steps.shape[0]
+
+        # 2. Process each step
+        selected_tokens_per_step = []
+        all_unique_token_ids = set()
+
+        for i in range(num_steps):
+            probs_this_step = probs_over_steps[i]
+            sorted_probs_full, sorted_indices_full = torch.sort(probs_this_step, descending=True)
+            
+            if len(sorted_probs_full) <= 1:
+                selected_tokens_per_step.append({'indices': torch.tensor([]), 'probs': torch.tensor([])})
+                continue
+
+            # a. Remove top-1 token
+            sorted_probs_remaining = sorted_probs_full[0:]
+            sorted_indices_remaining = sorted_indices_full[0:]
+            
+            sum_of_remaining_probs = torch.sum(sorted_probs_remaining)
+            if sum_of_remaining_probs <= 1e-9:
+                selected_tokens_per_step.append({'indices': torch.tensor([]), 'probs': torch.tensor([])})
+                continue
+
+            # b. Nucleus sampling on the remaining tokens
+            cumulative_probs = torch.cumsum(sorted_probs_remaining, dim=-1)
+            cutoff_index = (cumulative_probs > top_p * sum_of_remaining_probs).nonzero(as_tuple=True)[0]
+
+            nucleus_size = cutoff_index[0].item() + 1 if cutoff_index.numel() > 0 else len(sorted_probs_remaining)
+            nucleus_indices = sorted_indices_remaining[:nucleus_size]
+            nucleus_probs_original = sorted_probs_remaining[:nucleus_size]
+
+            # c. Renormalize over the remaining distribution (excluding top-1)
+            renormalized_nucleus_probs = nucleus_probs_original / sum_of_remaining_probs
+
+            step_data = {'indices': nucleus_indices, 'probs': renormalized_nucleus_probs}
+            selected_tokens_per_step.append(step_data)
+            all_unique_token_ids.update(nucleus_indices.tolist())
+
+        # 3. Assign consistent colors to tokens
+        unique_token_list = sorted(list(all_unique_token_ids))
+        if unique_token_list:
+            # Use a perceptually distinct colormap; limit to 20 for clarity
+            n_colors = min(len(unique_token_list), 20)
+            cmap = plt.cm.get_cmap('tab10' if n_colors <= 10 else 'tab20', n_colors)
+            token_to_color = {
+                token_id: cmap(i % n_colors) for i, token_id in enumerate(unique_token_list)
+            }
+        else:
+            token_to_color = {}
+
+        # 4. Plot
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.6 * num_steps)))  # Adaptive height
+
+        y_positions = np.arange(num_steps)
+
+        for i, step_data in enumerate(selected_tokens_per_step):
+            left = 0.0
+            if step_data['indices'].numel() > 0:
+                for token_id, prob in zip(step_data['indices'], step_data['probs']):
+                    prob_val = prob.item()
+                    color = token_to_color.get(token_id.item())
+                    if color is not None:
+                        ax.barh(y_positions[i], prob_val, left=left, color=color, edgecolor='none')
+                        left += prob_val
+
+        # 5. Legend with decoded tokens (clean, not repr)
+        legend_elements = []
+        for token_id in unique_token_list[:30]:  # 可选：限制最多30个token避免过载
+            try:
+                decoded = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
+                label = decoded.replace('\n', '\\n').replace('\t', '\\t')
+            except Exception:
+                label = f"[UNK:{token_id}]"
+            color = token_to_color[token_id]
+            legend_elements.append(Patch(facecolor=color, edgecolor='none', label=label))
+
+        if legend_elements:
+            ax.legend(
+                handles=legend_elements,
+                bbox_to_anchor=(1.02, 1),
+                loc='upper left',
+                frameon=False,
+                title="Nucleus Tokens",
+                title_fontsize=12,
+                ncol=2,                 # ← 关键：分两列
+                columnspacing=0.8,      # 列间距
+                handletextpad=0.3,      # 图标与文字间距
+                fontsize=10             # 文字大小微调
+            )
+        # 6. Formatting
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels([f"Step {j+1}" for j in range(num_steps)])
+        ax.invert_yaxis()
+        ax.set_xlabel(r"Renormalized Probability")
+        ax.set_ylabel("Reasoning Step")
+        ax.set_xlim(0, 1.0)
+
+        # Remove spines and grid for clean look
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_linewidth(0.5)
+        ax.spines['left'].set_linewidth(0.5)
+
+        plt.tight_layout(rect=[0, 0, 0.82, 1])
+
+        # 7. Save (prefer PDF for ICLR)
+        if not save_path.endswith(('.pdf', '.png')):
+            save_path += ".pdf"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"ICLR-style logit evolution plot saved to {save_path}")
+
     def generate(
-        self,
-        input_ids,
-        attention_mask,  # 注意力掩码在此方法中未被使用
-        max_new_tokens=16,  # 最多生成的新token数量
-        output_embedding=False,  # 是否返回生成的嵌入向量
-        synced_gpus=False,  # 是否在FSDP等分布式训练中同步GPU的前向传播次数
-        **kwargs
-    ):
+            self,
+            input_ids,
+            attention_mask,
+            max_new_tokens=16,
+            output_embedding=False,
+            synced_gpus=False,
+            tokenizer=None,
+            **kwargs
+        ):
+        # ======================= DEBUGGING BLOCK START =======================
+        rank = -1
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+
+        # This print is CRITICAL. It tells us if the function is even being entered on this rank.
+        print(f"[Rank {rank}] --- Entered generate function. Input shape: {input_ids.shape} ---", flush=True)
+        # ======================= DEBUGGING BLOCK END =========================
 
         # 重置计数器
         self.gen_forward_cnt = 0
@@ -242,81 +397,15 @@ class Coconut(nn.Module):
         )
         # 获取经过潜在推理后的最终输入嵌入
         inputs_embeds = outputs.inputs_embeds
-        '''
-        # 1. 将整个序列的嵌入向量重塑为 (seq_len, hidden_size) 以便PCA
-        all_embeddings = inputs_embeds[0].detach().cpu()  # Shape: [seq_len, hidden_size]
-        seq_len = all_embeddings.shape[0]
-        print(f"Total number of tokens in the sequence: {seq_len}")
 
-        # 2. 执行PCA降维
-        pca = PCA(n_components=2)
-        all_embeddings_2d = pca.fit_transform(all_embeddings)  # Shape: [seq_len, 2]
-        explained_variance = pca.explained_variance_ratio_.sum()
-        print(f"PCA explained variance ratio: {explained_variance:.2f}")
+        # --- 【修改点 1】: 移除原有的可视化代码块 ---
+        # 原有的代码块在这里被删除了。
 
-        # 3. 计算每个嵌入向量的 L2 范数
-        # .norm(dim=1) 计算每个 token 向量在特征维度上的 L2 范数
-        embedding_norms = all_embeddings.norm(dim=1).numpy()  # Shape: [seq_len]
-        print(f"Min Norm: {embedding_norms.min():.3f}, Max Norm: {embedding_norms.max():.3f}, Mean Norm: {embedding_norms.mean():.3f}")
+        # --- 【新增代码 1】: 初始化一个列表来收集CoT步骤的logits ---
+        cot_logits_list = []
 
-        # 4. 找到潜在标记（latent）的位置
-        latent_positions = (input_ids[0] == self.latent_token_id).nonzero().squeeze(-1)
-        latent_positions = latent_positions.cpu().numpy()
-
-        # 5. 创建掩码，区分普通token和latent token
-        is_latent = torch.zeros(seq_len, dtype=torch.bool)
-        is_latent[latent_positions] = True
-
-        # 6. 分离普通token和latent token的坐标 (用于PCA)
-        normal_points = all_embeddings_2d[~is_latent]
-        latent_points = all_embeddings_2d[is_latent]
-
-        # 7. 创建包含两个子图的画布
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))  # 一行两列
-
-        # === 子图 1: PCA Visualization ===
-        # 绘制普通 token
-        ax1.scatter(normal_points[:, 0], normal_points[:, 1],
-                    c='lightgray', s=100, alpha=0.9, label='Normal Tokens', edgecolors='blue')
-        # 绘制 latent token
-        ax1.scatter(latent_points[:, 0], latent_points[:, 1],
-                    c='red', s=100, alpha=0.9, label='Latent Tokens', edgecolors='black', linewidth=1)
-
-        # 连接 latent token 的轨迹
-        if len(latent_points) > 1:
-            ax1.plot(latent_points[:, 0], latent_points[:, 1],
-                     color='red', linewidth=2.5, alpha=0.7, zorder=5)
-
-        # 为每个 latent 点标注序号
-        for i, (x, y) in enumerate(latent_points):
-            ax1.annotate(f'L{i+1}', (x, y),
-                        textcoords="offset points", xytext=(0,10),
-                        ha='center', fontsize=12, fontweight='bold', color='darkred')
-
-        ax1.set_title(f"PCA Visualization of Embeddings\nExplained Variance: {explained_variance:.2f}")
-        ax1.set_xlabel("First Principal Component")
-        ax1.set_ylabel("Second Principal Component")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        # === 子图 2: Embedding Norm Curve ===
-        # 绘制所有 token 的范数曲线
-        ax2.plot(range(seq_len), embedding_norms, color='tab:blue', linewidth=2, label='Embedding Norm')
-
-        ax2.set_title("L2 Norm of Each Token Embedding")
-        ax2.set_xlabel("Token Position (Sequence Index)")
-        ax2.set_ylabel("L2 Norm")
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # 10. 保存并关闭
-        save_path = 'pca_of_latent.png'
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        '''
-
-
-        # --- 生成第一个新token ---
+        # Generate first token
+        cot_logits_list.append(outputs.logits[0, -1, :])
         next_token = torch.argmax(outputs.logits[0, -1]).item()
         tokens.append(next_token)
         new_token_embed = self.embedding(
@@ -324,27 +413,56 @@ class Coconut(nn.Module):
         ).view(1, 1, -1)
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
 
-        # --- 生成后续token ---
-        first_layer_attn = None
-        for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(
-                inputs_embeds=new_inputs_embeds,
-                output_attentions=True,
-                output_hidden_states=False,
-            )
+        # --- Generation loop ---
+        print(f"[Rank {rank}] Starting generation loop for {max_new_tokens - 1} steps.", flush=True)
+        
+        for i in range(max_new_tokens - 1):
+            # This print tells us if the loop is actually running.
+            print(f"[Rank {rank}] Loop iteration {i}", flush=True)
+
+            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
+
+            cot_logits_list.append(outputs.logits[0, -1, :])
 
             next_token = torch.argmax(outputs.logits[0, -1]).item()
             if next_token == self.eos_token_id:
+                print(f"[Rank {rank}] EOS token generated. Breaking loop.", flush=True)
                 break
-
-            first_layer_attn = outputs.attentions[0][-1]
-            avg_attn = first_layer_attn.mean(dim=0).cpu().numpy()  # [seq_len, seq_len]
             tokens.append(next_token)
             new_token_embed = self.embedding(
                 torch.tensor(next_token, device=input_ids.device)
             ).view(1, 1, -1)
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
+
+        print(f"[Rank {rank}] Loop finished. Collected {len(cot_logits_list)} sets of logits.", flush=True)
+
+        # --- Plotting logic ---
+        is_main_process = (rank == 0 or rank == -1) # rank -1 for non-distributed case
+        if is_main_process and tokenizer and cot_logits_list:
+            print(f"[Rank {rank}] Conditions met for plotting. Stacking logits.", flush=True)
+            cot_logits = torch.stack(cot_logits_list, dim=0)
+            
+            print(f"[Rank {rank}] Logits stacked, shape: {cot_logits.shape}. Calling plot function.", flush=True)
+            self._plot_logit_evolution(
+                cot_logits, 
+                tokenizer, 
+                save_path="cot_logit_evolution.png"
+            )
+            print(f"[Rank {rank}] Plotting finished.", flush=True)
+        elif is_main_process:
+            # If we are on the main process but didn't plot, why?
+            print(f"[Rank {rank}] On main process but skipping plot. "
+                  f"Tokenizer exists: {tokenizer is not None}, "
+                  f"Logits exist: {bool(cot_logits_list)}", flush=True)
+
+        if synced_gpus:
+            # in FSDP, the number of forward pass need to be the same across devices
+            while (
+                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
+            ):  # leave some room for latent tokens
+                self.gen_forward_cnt += 1
+                _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
 
         if output_embedding:
             return torch.tensor(tokens).view(1, -1), new_inputs_embeds

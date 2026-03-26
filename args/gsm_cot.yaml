@@ -4,7 +4,7 @@ project: coconut
 save_path: YOUR_PATH_TO_SAVE_THE_MODEL
 name: gsm-cot
 
-only_eval: False
+only_eval: True
 
 coconut: False
 cot: True
@@ -18,13 +18,13 @@ pad_latent_to_max: True
 
 save_only_improve: True
 uniform_prob: 0.0
-model_id: openai-community/gpt2
-load_model_path: None
+model_id: /home/coconut/gpt2
+load_model_path: /home/coconut/YOUR_PATH_TO_SAVE_THE_MODEL/gsm-cot/checkpoint_12
 seed: 0
 resume: 0
 bf16: False
 train_path: data/gsm_train.json
-val_path: data/gsm_valid.json
+val_path: data/gsm_test2.json
 reset_optimizer: False
 batch_size_training: 32
 debug: False

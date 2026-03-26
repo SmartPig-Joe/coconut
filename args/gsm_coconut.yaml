@@ -18,8 +18,8 @@ pad_latent_to_max: True
 
 save_only_improve: False
 uniform_prob: 0.0
-model_id: openai-community/gpt2
-load_model_path: YOUR_PATH_TO_COT_CHECKPOINT
+model_id: /home/coconut/gpt2
+load_model_path: /home/coconut/YOUR_PATH_TO_SAVE_THE_MODEL/gsm-coconut-norm/checkpoint_13
 seed: 0
 resume: 3
 bf16: False

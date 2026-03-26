@@ -102,8 +102,7 @@ def main():
         max_new_tokens = 128
 
     # --- 9. 计算 stage 并获取单个样本 ---
-    #scheduled_stage = min(configs.resume // configs.epochs_per_stage, configs.max_latent_stage)
-    scheduled_stage = 2
+    scheduled_stage = min(configs.resume // configs.epochs_per_stage, configs.max_latent_stage)
     print(f"Using scheduled_stage = {scheduled_stage} for evaluation.")
 
     dataset_gen_val = get_question_latent_dataset(

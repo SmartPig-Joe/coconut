@@ -13,7 +13,7 @@ no_cot: False
 
 c_thought: 1
 epochs_per_stage: 5
-max_latent_stage: 0
+max_latent_stage: 6
 pad_latent_to_max: True
 
 save_only_improve: False
@@ -24,7 +24,7 @@ seed: 0
 resume: 40
 bf16: False
 train_path: data/prosqa_train.json
-val_path: data/prosqa_valid.json
+val_path: data/prosqa_valid2.json
 reset_optimizer: True
 batch_size_training: 32
 debug: False
