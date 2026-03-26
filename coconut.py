@@ -335,8 +335,8 @@ class Coconut(nn.Module):
                 continue
 
             # a. Remove top-1 token
-            sorted_probs_remaining = sorted_probs_full[0:]
-            sorted_indices_remaining = sorted_indices_full[0:]
+            sorted_probs_remaining = sorted_probs_full[1:]
+            sorted_indices_remaining = sorted_indices_full[1:]
             
             sum_of_remaining_probs = torch.sum(sorted_probs_remaining)
             if sum_of_remaining_probs <= 1e-9:
