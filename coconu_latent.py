@@ -472,6 +472,7 @@ class Coconut(nn.Module):
 
         # --- 新增代码开始：直接从outputs.logits提取数据并绘图 ---
         # 仅在主设备 (gpu:0) 上且传入了tokenizer时执行
+        '''
         if input_ids.device.index == 0 and tokenizer:
             # 1. 找到所有 latent token 的位置
             if latent_positions.numel() > 0:
@@ -481,6 +482,7 @@ class Coconut(nn.Module):
                 
                 # 调用绘图函数
                 self._plot_logit_evolution(reasoning_logits, tokenizer)
+        '''
         # --- 新增代码结束 ---
 
         # --- 生成第一个新token ---

@@ -24,7 +24,7 @@ seed: 0
 resume: 15
 bf16: False
 train_path: data/gsm_train.json
-val_path: data/gsm_test2.json
+val_path: data/gsm_test.json
 reset_optimizer: True
 batch_size_training: 32
 debug: False
