@@ -490,7 +490,7 @@ class Coconut(nn.Module):
         if latent_positions.numel() > 0:
             logit_indices_for_reasoning = latent_positions - 1
             reasoning_logits_latent = outputs.logits[0, logit_indices_for_reasoning, :]
-            self.all_is_values.extend(self._compute_IS_values(reasoning_logits_latent, skip_top_k=1))
+            self.all_is_values.extend(self._compute_IS_values(reasoning_logits_latent, skip_top_k=2))
 
         # --- 【修改点 1】: 移除原有的可视化代码块 ---
         # 原有的代码块在这里被删除了。
